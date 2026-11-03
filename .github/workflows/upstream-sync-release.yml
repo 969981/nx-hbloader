@@ -50,7 +50,7 @@ jobs:
     name: Build and publish hbl.nsp
     runs-on: ubuntu-latest
     container:
-      image: devkitpro/devkita64:20260610
+      image: devkitpro/devkita64:latest
     needs: sync
     if: ${{ needs.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'push' }}
     timeout-minutes: 60
@@ -132,7 +132,7 @@ jobs:
             echo "Source commit: $SOURCE_SHA"
             echo "Build target: hbl.nsp (ExeFS PFS0, not a retail-installable game)"
             echo "Make command: make -j2 RELEASE=1"
-            echo "Toolchain: devkitpro/devkita64:20260610"
+            echo "Toolchain: devkitpro/devkita64:latest"
             echo "Built UTC: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
             echo "NSP bytes: $(wc -c < hbl.nsp)"
             echo "GCC: $("$DEVKITPRO/devkitA64/bin/aarch64-none-elf-gcc" --version | head -n 1)"
