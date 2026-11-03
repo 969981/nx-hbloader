@@ -1,0 +1,163 @@
+name: Sync upstream and release hbloader
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nx-hbloader-sync-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync switchbrew/nx-hbloader
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
+    steps:
+      - name: Checkout repository with full history
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Merge upstream while preserving local CI
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream https://github.com/switchbrew/nx-hbloader.git
+          git fetch upstream master --no-tags
+          changed=false
+          if ! git merge-base --is-ancestor refs/remotes/upstream/master HEAD; then
+            git merge --no-edit refs/remotes/upstream/master
+            git push origin HEAD:refs/heads/master
+            changed=true
+          fi
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          echo "Source: $(git rev-parse HEAD); upstream_changed=$changed"
+
+  build-release:
+    name: Build and publish hbl.nsp
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkita64:20260610
+    needs: sync
+    if: ${{ needs.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'push' }}
+    timeout-minutes: 60
+    steps:
+      - name: Checkout synchronized source
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check release tag
+        id: version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          source_sha="$(git rev-parse HEAD)"
+          tag="master-${source_sha:0:12}"
+          echo "sha=$source_sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          status="$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$tag")"
+          case "$status" in
+            200)
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+              echo "Release $tag already exists; skipping build."
+              ;;
+            404) echo "exists=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "GitHub API returned HTTP $status" >&2; exit 1 ;;
+          esac
+
+      - name: Check devkitA64 and libnx toolchain
+        if: steps.version.outputs.exists == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "$DEVKITPRO/libnx/switch_rules"
+          test -d "$DEVKITPRO/devkitA64"
+          command -v make
+          command -v zip
+          "$DEVKITPRO/devkitA64/bin/aarch64-none-elf-gcc" --version | head -n 1
+
+      - name: Build hbloader ExeFS NSP
+        if: steps.version.outputs.exists == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -j2 RELEASE=1
+          test -s hbl.nsp
+          test -s hbl.elf
+          ls -lh hbl.nsp hbl.elf hbl.nso hbl.npdm
+
+      - name: Package release and debug symbols
+        if: steps.version.outputs.exists == 'false'
+        shell: bash
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          SOURCE_SHA: ${{ steps.version.outputs.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/stage/atmosphere dist/debug
+          cp hbl.nsp dist/hbl.nsp
+          cp hbl.nsp dist/stage/atmosphere/hbl.nsp
+          (cd dist/stage && zip -qr "../nx-hbloader-${TAG}-atmosphere.zip" atmosphere)
+          rm -rf dist/stage
+          cp hbl.elf hbl.nso hbl.npdm dist/debug/
+          if [ -s hbl.map ]; then cp hbl.map dist/debug/; fi
+          if [ -s build/hbl.map ]; then cp build/hbl.map dist/debug/; fi
+          (cd dist/debug && zip -q9 "../nx-hbloader-${TAG}-debug.zip" ./*)
+          rm -rf dist/debug
+          {
+            echo "Repository: $GITHUB_REPOSITORY"
+            echo "Upstream: switchbrew/nx-hbloader"
+            echo "Source commit: $SOURCE_SHA"
+            echo "Build target: hbl.nsp (ExeFS PFS0, not a retail-installable game)"
+            echo "Make command: make -j2 RELEASE=1"
+            echo "Toolchain: devkitpro/devkita64:20260610"
+            echo "Built UTC: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "NSP bytes: $(wc -c < hbl.nsp)"
+            echo "GCC: $("$DEVKITPRO/devkitA64/bin/aarch64-none-elf-gcc" --version | head -n 1)"
+          } > dist/BUILD-INFO.txt
+          (cd dist && sha256sum hbl.nsp ./*.zip BUILD-INFO.txt > SHA256SUMS)
+          (cd dist && sha256sum -c SHA256SUMS)
+
+      - name: Publish release
+        if: steps.version.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          target_commitish: master
+          name: nx-hbloader ${{ steps.version.outputs.tag }}
+          body: |
+            Automated build of `969981/nx-hbloader` tracking `switchbrew/nx-hbloader`.
+            Source commit: `${{ steps.version.outputs.sha }}`
+            Built with devkitPro devkitA64/libnx using `make -j2 RELEASE=1`.
+            `hbl.nsp` is an ExeFS homebrew loader component, **not** a standard installable game package.
+            ZIP includes `atmosphere/hbl.nsp` for copying into a matching CFW installation.
+            Debug ZIP includes ELF, NSO and NPDM for inspection; see SHA256SUMS and BUILD-INFO.txt.
+            Build success does not guarantee runtime compatibility with each Atmosphere/HOS version.
+          files: |
+            dist/hbl.nsp
+            dist/*.zip
+            dist/SHA256SUMS
+            dist/BUILD-INFO.txt
+          fail_on_unmatched_files: true
